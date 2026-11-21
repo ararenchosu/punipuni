@@ -256,6 +256,121 @@ BROWSER_HEADERS = {
 
 
 # ============================================================================
+# 種族制限・ゲート解析用のデータロード
+# ============================================================================
+
+TRIBE_NAMES = {1: "イサマシ", 2: "フシギ", 3: "ゴーケツ", 4: "プリチー", 5: "ポカポカ",
+               6: "ウスラカゲ", 7: "ブキミー", 8: "ニョロロン"}
+_STAGE_MASK_CACHE = {"mtime": None, "data": {}}
+_YOUKAI_TRIBE_CACHE = {"mtime": None, "data": {}}
+_GATE_CACHE = {"mtime": None, "data": {}}
+
+def _data_path(name: str) -> str:
+    return os.path.join(BASE_DIR, "data", name)
+
+def _load_table_cached(cache: dict, filename: str, build):
+    path = _data_path(filename)
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return {}
+    if cache["mtime"] != mtime:
+        try:
+            with open(path, encoding="utf-8") as f:
+                raw = f.read()
+            cache["data"] = build(raw)
+            cache["mtime"] = mtime
+        except OSError:
+            return {}
+    return cache.get("data", {})
+
+def _build_masks(raw: str) -> dict:
+    out = {}
+    for rec in raw.split("*"):
+        f = rec.split("|")
+        if len(f) > 25 and f[0].isdigit() and re.fullmatch(r"[01]{11}", f[25] or ""):
+            out[int(f[0])] = f[25]
+    return out
+
+def _build_tribes(raw: str) -> dict:
+    out = {}
+    for rec in raw.split("*"):
+        f = rec.split("|")
+        if len(f) > 4 and f[0].isdigit() and f[4].isdigit():
+            out[f[0]] = int(f[4])
+    return out
+
+def _build_gates(raw: str) -> dict:
+    out = {}
+    for rec in raw.split("*"):
+        f = rec.split("^")
+        if len(f) > 3 and f[2].startswith("【") and f[0].isdigit():
+            try:
+                p1 = int(f[3])
+            except ValueError:
+                p1 = 0
+            out.setdefault(int(f[0][:-1]), []).append((int(f[1]) if f[1].isdigit() else 0, f[2], p1))
+    return out
+
+def stage_allowed_tribes(stage_id: int):
+    """この面で使える種族の集合。制限がなければ None"""
+    masks = _load_table_cached(_STAGE_MASK_CACHE, "ywp_mst_stage.txt", _build_masks)
+    m = masks.get(int(stage_id))
+    if not m:
+        return None
+    allowed = {i + 1 for i, ch in enumerate(m) if ch == "0"}
+    return allowed if len(allowed) < 11 else None
+
+def deck_for_tribes(c: Client, allowed: set) -> list:
+    """使える種族の妖怪から、攻撃力の高い順に5体"""
+    tribes = _load_table_cached(_YOUKAI_TRIBE_CACHE, "ywp_mst_youkai.txt", _build_tribes)
+    atk = c.youkai_attack()
+    ok = [y for y in sorted(atk, key=lambda y: -atk[y]) if tribes.get(str(y)) in allowed]
+    return ok[:5]
+
+def prepare_deck_for_stage(c: Client, stage_id: int, state: dict) -> str:
+    """面に合わせてデッキを整える（同期処理）。"""
+    allowed = stage_allowed_tribes(stage_id)
+    if allowed is None:
+        if state.get("restricted"):
+            state["restricted"] = False
+            try:
+                c.sort_deck()
+            except Exception as e:
+                log_line(f"[deck] 強い順に戻せなかった: {e}")
+        return "ok"
+    
+    names = "・".join(TRIBE_NAMES.get(t, f"種族{t}") for t in sorted(allowed))
+    deck = deck_for_tribes(c, allowed)
+    if not deck:
+        log_line(f"[deck] stage={stage_id} 使える種族（{names}）の妖怪がいない")
+        return "no_member"
+        
+    cur, _ = c.current_deck()
+    if [str(y) for y in cur] != [str(y) for y in deck]:
+        time.sleep(random.uniform(2.0, 5.0))
+        rc = c.deck_edit(deck)
+        if rc != 0:
+            log_line(f"[deck] stage={stage_id} 編成を変えられない rc={rc}")
+            return "edit_failed"
+        log_line(f"[deck] stage={stage_id} 種族制限（{names}）→ {len(deck)}体で編成")
+    state["restricted"] = True
+    return "ok"
+
+def gate_hint(stage_id: int, limit: int = 6) -> str:
+    """始められない面の手がかり。"""
+    gates = _load_table_cached(_GATE_CACHE, "ywp_mst_stage_condition.txt", _build_gates)
+    if not gates:
+        return ""
+    area = int(stage_id) // 1000
+    near = [(sid, g) for sid, gl in gates.items() if sid // 1000 == area
+            for g in gl if sid != int(stage_id)]
+    near.sort()
+    near = [x for x in near if x[0] < int(stage_id)][-limit:] or near[:limit]
+    return " / ".join(f"{sid} {g[1]}" for sid, g in near)
+
+
+# ============================================================================
 # 可変設定（/管理パネル から編集 → settings.json に保存して再起動後も残る）
 # ============================================================================
 # ここに載せた項目は稼働中でも書き換えられる。実体はこのモジュールの変数を
@@ -4088,36 +4203,52 @@ def deck_kept(c: Client) -> list[str]:
 
 
 async def sort_deck_now(job: FarmJob, c: Client, why: str):
-    """デッキを攻撃力の高い順に組み直す（STRONG_DECK）。失敗しても周回は続ける
-
-    自動編成中は今のリーダー（仲間にした妖怪）をそのままにして、残り4体を強い順にする。
-    """
-    if not STRONG_DECK:
-        await ensure_auto_deck_priority(job, c)
+    """デッキをステージに合わせて組み替える"""
+    
+    # ① 30104006 の特殊編成（最優先）
+    if job.stage_id == SPECIAL_STAGE_ID:
+        await special_deck_for_30104006(job, c, why)
         return
+
+    # ② 種族制限のチェックと編成
+    state = {"restricted": getattr(job, 'restricted_deck', False)}
+    res = await asyncio.to_thread(prepare_deck_for_stage, c, job.stage_id, state)
+    job.restricted_deck = state.get("restricted", False)
+    
+    if res == "no_member":
+        log_line(f'種族制限エラー: ステージ {job.stage_id} に使える妖怪がいません')
+        return
+    elif res == "edit_failed":
+        log_line(f'種族制限エラー: ステージ {job.stage_id} の編成変更に失敗しました')
+        return
+
+    # ③ 制限がないステージでの攻撃力順組み替え（STRONG_DECKが有効な場合のみ）
+    if not STRONG_DECK:
+        return
+        
     strong = deck_kept(c)
     if strong:
         log_line(f'強い順の編成をしない（{why}）: {rank_label(STRONG_DECK_KEEP_RANK)}以上が'
                  f'{len(strong)}体いる {strong}')
-        await ensure_auto_deck_priority(job, c)
         return
+        
     leader = None
     if job.auto_deck:
         deck, _ = c.current_deck()
         leader = deck[0] if deck else None
+        
     try:
         code, old, new = await asyncio.to_thread(c.sort_deck, leader)
     except Exception as e:
         log_line(f'強い順の編成に失敗（周回は続ける・{why}）: {str(e)[:150]}')
-        await ensure_auto_deck_priority(job, c)
         return
+        
     if code == 'same':
-        await ensure_auto_deck_priority(job, c)
         return
     if code != 0:
         log_line(f'強い順の編成: deckEdit rc={code}（{why}・デッキは変わっていない）')
-        await ensure_auto_deck_priority(job, c)
         return
+        
     job.deck_sorts += 1
     job.deck_order = list(new)
     atk = c.youkai_attack()
